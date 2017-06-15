@@ -102,6 +102,72 @@ class GPUDataParallelModelTest(TestCase):
             result_8gpus = self.run_model(range(8))
             self.assertTrue(np.allclose(result_1gpus, result_8gpus))
 
+    def test_checkpoint_params(self):
+        def add_input_ops(model):
+            pass
+
+        def add_model_ops(model, loss_scale):
+            model.NHWC2NCHW("data", "data_nchw")
+            model.Conv("data_nchw", 'conv1', 3, 64,
+                       weight_init=("MSRAFill", {}), kernel=7,
+                       stride=2, pad=3, no_bias=0)
+            model.SpatialBN('conv1', 'conv1_spatbn_relu', 64, epsilon=1e-3)
+            model.Relu('conv1_spatbn_relu', 'conv1_spatbn_relu')
+            model.MaxPool('conv1_spatbn_relu', 'pool1', kernel=3, stride=2)
+            model.FC('pool1', 'fc', dim_in=(64 * 56 * 56), dim_out=100)
+            model.Sigmoid('fc', 'fc_sigm')
+            model.Softmax('fc_sigm', 'softmax')
+            model.LabelCrossEntropy(['softmax', 'label'], 'xent')
+            loss = model.AveragedLoss('xent', 'loss')
+
+            # Add a duplicate param init to ensure it does not cause issues
+            model.param_init_net.ConstantFill(
+                [], ["fc_w"], shape=((64 * 56 * 56), 1000)
+            )
+            return [loss]
+
+        def add_parameter_update_ops(model):
+            model.Iter("ITER")
+            LR = model.param_init_net.ConstantFill(
+                [], 'LR', shape=[1], value=0.1
+            )
+            for param in model.GetParams():
+                param_grad = model.param_to_grad[param]
+                param_momentum = model.param_init_net.ConstantFill(
+                    [param], param + '_momentum', value=0.0
+                )
+                model.net.MomentumSGDUpdate(
+                    [param_grad, param_momentum, LR, param],
+                    [param_grad, param_momentum, param],
+                )
+
+        model = cnn.CNNModelHelper(
+            order="NHWC",
+            name="test",
+        )
+        data_parallel_model.Parallelize_GPU(
+            model,
+            input_builder_fun=add_input_ops,
+            forward_pass_builder_fun=add_model_ops,
+            param_update_builder_fun=add_parameter_update_ops,
+            devices=[1, 2, 3],
+        )
+
+        # Only gpu_1 params should be returned (gpu_1 is the first gpu)
+        checkpoint_params = data_parallel_model.GetCheckpointParams(model)
+        for p in model.GetParams("gpu_1/"):
+            self.assertTrue(p in checkpoint_params)
+            self.assertTrue(p + "_momentum" in checkpoint_params)
+        for p in model.GetParams("gpu_2/"):
+            self.assertFalse(p in checkpoint_params)
+        for c in model.GetComputedParams("gpu_1/"):
+            self.assertTrue(c in checkpoint_params)
+        for c in model.GetComputedParams("gpu_2/"):
+            self.assertFalse(c in checkpoint_params)
+        self.assertFalse(core.BlobReference("gpu_1/data") in checkpoint_params)
+        self.assertTrue(core.BlobReference("gpu_1/ITER") in checkpoint_params)
+
+
 
 @unittest.skipIf(not workspace.has_gpu_support, "No gpu support.")
 @unittest.skipIf(workspace.NumCudaDevices() < 2, "Need at least 2 GPUs.")
@@ -289,7 +355,7 @@ class SparseDataParallelModelTest(TestCase):
                 else:
                     param_momentum = model.param_init_net.ConstantFill(
                         [param],
-                        '{}_momentum'.format(param),
+                        param + '_momentum',
                         value=0.0,
                     )
                     model.net.SparseMomentumSGDUpdate(
@@ -573,3 +639,198 @@ class ParallelizeGPUBMUFTest(TestCase):
         # Check params update step
         np.testing.assert_equal(w_0, w_g_ + v_w)
         np.testing.assert_equal(b_0, b_g_ + v_b)
+
+
+@unittest.skipIf(not workspace.has_gpu_support, "No gpu support.")
+@unittest.skipIf(workspace.NumCudaDevices() < 2, "Need at least 2 GPUs.")
+class SparseDataParallelModelTestWithSharedIndices(TestCase):
+
+    '''
+    Create and run the model. We try with both storing indices for gather
+    on CPU and on GPU
+    '''
+    def run_model(self, V, gpu_devices):
+
+        def input_builder_fun(model):
+            return None
+
+        def model_build_fun(model, loss_scale):
+            gpu_vecs_gathered = []
+            gpu_vecs = []
+            for num, vec in enumerate(self.vecs):
+                gpu_vec = model.param_init_net.CopyCPUToGPU(
+                    vec, 'gpuvec_{}'.format(num),
+                )
+                if num != 2:
+                    model.params.append(gpu_vec)
+                gpu_vecs.append(gpu_vec)
+            for num, gpu_vec in enumerate(gpu_vecs):
+                gpu_vec_gathered = model.net.Gather(
+                    [gpu_vec, 'indices'],
+                    ['gpu_vec_gathered_{}'.format(num)]
+                )
+                gpu_vecs_gathered.append(gpu_vec_gathered)
+
+            assert len(gpu_vecs_gathered) == 3
+
+            fc = model.net.FC(
+                [
+                    gpu_vecs_gathered[2],
+                    gpu_vecs_gathered[0],
+                    gpu_vecs_gathered[1],
+                ],
+                ['fc'],
+            )
+            _, loss = model.net.SoftmaxWithLoss(
+                [fc, 'label'],
+                ['ce_loss', 'avg_loss'],
+                only_loss=True,
+            )
+            loss = model.Scale(loss, scale=loss_scale)
+            model.net.Print(loss, [], limit=10)
+            return [loss]
+
+        def param_update_fun(model):
+            ONE = model.param_init_net.ConstantFill(
+                [], "ONE", shape=[1], value=1.0,
+            )
+            LR = model.CopyCPUToGPU(self.LR, "LR")
+            for param in model.GetParams():
+                param_grad = model.param_to_grad[param]
+                if not isinstance(param_grad, core.GradientSlice):
+                    model.WeightedSum([param, ONE, param_grad, LR], param)
+                else:
+                    model.net.ScatterWeightedSum(
+                        [
+                            param,
+                            ONE,
+                            param_grad.indices,
+                            param_grad.values,
+                            ONE,
+                        ],
+                        param,
+                    )
+
+        workspace.ResetWorkspace()
+        model = cnn.CNNModelHelper(
+            order="NHWC",
+            name="sparse_test{}".format(gpu_devices),
+        )
+        batch_size = 32
+        batch_per_device = batch_size // len(gpu_devices)
+
+        with core.NameScope("cpu"):
+            with core.DeviceScope(core.DeviceOption(caffe2_pb2.CPU)):
+                self.ITER = model.Iter("ITER")
+                self.LR = model.net.LearningRate(
+                    [self.ITER],
+                    "LR",
+                    base_lr=(-0.1),
+                    policy="fixed",
+                )
+                '''
+                self.vecs consists of 3 big blobs on which we call Gather:
+                1) FC weights, shape=(V, 16)
+                2) FC bias, shape=(V)
+                3) FC input, shape=(batch_per_device, 16)
+                '''
+                self.vecs = [
+                    model.param_init_net.UniformFill(
+                        [], "vec_{}".format(num), shape=[V, 16])
+                    for num in range(2)
+                ]
+                self.vecs.append(
+                    model.param_init_net.UniformFill(
+                        [],
+                        "vec_2", shape=[batch_per_device, 16]
+                    )
+                )
+                self.ONE_CPU = model.param_init_net.ConstantFill(
+                    [], "ONE_CPU", shape=[1], value=1.0,
+                )
+
+        data_parallel_model.Parallelize_GPU(
+            model,
+            input_builder_fun=input_builder_fun,
+            forward_pass_builder_fun=model_build_fun,
+            param_update_builder_fun=param_update_fun,
+            devices=gpu_devices,
+        )
+
+        # Update the vecs
+        with core.DeviceScope(core.DeviceOption(caffe2_pb2.CUDA, 0)):
+            for num, vec in enumerate(self.vecs[:-1]):
+                model.CopyGPUToCPU("gpu_0/gpuvec_{}".format(num), vec)
+
+        # Each run has same input, independent of number of gpus
+        for i in range(0, 10):
+            np.random.seed(2603)
+            full_indices = np.random.permutation(V)[:batch_size].reshape(
+                batch_size
+            )
+            full_labels = full_indices[:] % batch_per_device
+
+            for (j, g) in enumerate(gpu_devices):
+                st = j * batch_per_device
+                en = st + batch_per_device
+                indices = full_indices[st:en].astype(np.int32)
+                labels = full_labels[st:en].astype(np.int32)
+
+                with core.DeviceScope(core.DeviceOption(caffe2_pb2.CUDA, g)):
+                    workspace.FeedBlob("gpu_{}/indices".format(g), indices)
+                    workspace.FeedBlob("gpu_{}/label".format(g), labels)
+
+            if i == 0:
+                workspace.RunNetOnce(model.param_init_net)
+                # Force vecs to be same on all runs
+                orig_vecs = [
+                    np.random.rand(V, 16).astype(np.float32),
+                    np.random.rand(V).astype(np.float32),
+                    np.random.rand(V, 16).astype(np.float32),
+                ]
+                for vec, orig_vec in zip(self.vecs, orig_vecs):
+                    workspace.FeedBlob(
+                        vec,
+                        orig_vec
+                    )
+                for g in gpu_devices:
+                    for num, orig_vec in enumerate(orig_vecs):
+                        workspace.FeedBlob(
+                            "gpu_{}/gpuvec_{}".format(g, num),
+                            orig_vec,
+                            device_option=core.DeviceOption(
+                                caffe2_pb2.CUDA, g),
+                        )
+                workspace.CreateNet(model.net)
+
+            workspace.RunNet(model.net.Proto().name)
+
+            idx = workspace.FetchBlob('gpu_0/indices')
+            grad_slices = [
+                workspace.FetchBlob(
+                    'gpu_{}/gpu_vec_gathered_{}_grad'.format(g, num))
+                for g in gpu_devices for num in range(2)
+            ]
+            for grad_slice in grad_slices:
+                # print (len(idx), len(grad_slice))
+                assert len(idx) == len(grad_slice), (
+                    'Number of indices {} is not same as number of gradient '
+                    'slices {}. This might lead to illegal memory access'.format(
+                        len(idx), len(grad_slice)
+                    )
+                )
+
+    def test_sparse_shared_indices_gpu(self):
+        '''
+            Test that the model has same number of indices and gradient rows
+            given total batchsize, independent of number of GPUs.
+        '''
+        V = 10000
+        self.run_model(V, [0, 1])
+        self.run_model(V, [0])
+
+        if workspace.NumCudaDevices() >= 4:
+            self.run_model(V, range(4))
+
+        if workspace.NumCudaDevices() >= 8:
+            self.run_model(V, range(8))
