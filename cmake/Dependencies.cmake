@@ -130,7 +130,7 @@ if(BUILD_TEST)
 
   # We will not need to test benchmark lib itself.
   set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "Disable benchmark testing as we don't need it.")
-  # We will not need to install benchmark since we link it statically. 
+  # We will not need to install benchmark since we link it statically.
   set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "Disable benchmark install to avoid overwriting vendor install.")
   add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/benchmark)
   caffe2_include_directories(${PROJECT_SOURCE_DIR}/third_party/benchmark/include)
@@ -257,7 +257,6 @@ if(BUILD_PYTHON)
   set(USE_OBSERVERS ON)
   if(PYTHONINTERP_FOUND AND PYTHONLIBS_FOUND AND NUMPY_FOUND)
     caffe2_include_directories(${PYTHON_INCLUDE_DIRS} ${NUMPY_INCLUDE_DIR})
-    list(APPEND Caffe2_PYTHON_DEPENDENCY_LIBS ${PYTHON_LIBRARIES})
   else()
     message(WARNING "Python dependencies not met. Not compiling with python. Suppress this warning with -DBUILD_PYTHON=OFF")
     set(BUILD_PYTHON OFF)
@@ -327,13 +326,14 @@ endif()
 if(USE_CUDA)
   include(cmake/Cuda.cmake)
   if(HAVE_CUDA)
-    # CUDA 9.0 requires GCC version <= 6
-    if (CUDA_VERSION VERSION_EQUAL 9.0)
+    # CUDA 9.x requires GCC version <= 6
+    if ((CUDA_VERSION VERSION_EQUAL   9.0) OR
+        (CUDA_VERSION VERSION_GREATER 9.0  AND CUDA_VERSION VERSION_LESS 10.0))
       if (CMAKE_C_COMPILER_ID STREQUAL "GNU" AND
           NOT CMAKE_C_COMPILER_VERSION VERSION_LESS 7.0 AND
           CUDA_HOST_COMPILER STREQUAL CMAKE_C_COMPILER)
         message(FATAL_ERROR
-          "CUDA 9.0 is not compatible with GCC version >= 7. "
+          "CUDA ${CUDA_VERSION} is not compatible with GCC version >= 7. "
           "Use the following option to use another version (for example): \n"
           "  -DCUDA_HOST_COMPILER=/usr/bin/gcc-6\n")
       endif()
@@ -434,6 +434,16 @@ if(USE_GLOO)
   endif()
 endif()
 
+# ---[ profiling
+if(USE_PROF)
+  find_package(htrace)
+  if(htrace_FOUND)
+    set(USE_PROF_HTRACE ON)
+  else()
+    message(WARNING "htrace not found. Caffe2 will build without htrace prof")
+  endif()
+endif()
+
 if (USE_MOBILE_OPENGL)
   if (ANDROID)
     list(APPEND Caffe2_DEPENDENCY_LIBS EGL GLESv2)
@@ -474,5 +484,7 @@ if (USE_ATEN)
 endif()
 
 if (USE_ZSTD)
+  list(APPEND Caffe2_DEPENDENCY_LIBS libzstd_static)
+  caffe2_include_directories(${PROJECT_SOURCE_DIR}/third_party/zstd/lib)
   add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/zstd/build/cmake)
 endif()
